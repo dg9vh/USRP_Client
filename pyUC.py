@@ -20,7 +20,7 @@
 
 from tkinter import *
 from tkinter import ttk
-from time import time, sleep, clock, localtime, strftime
+from time import time, sleep, localtime, strftime
 from random import randint
 from tkinter import messagebox
 import socket
@@ -42,7 +42,7 @@ from pathlib import Path
 import hashlib
 from tkinter import font
 
-UC_VERSION = "1.2.1"
+UC_VERSION = "1.2.2"
 
 ###################################################################################
 # Declare input and output ports for communication with AB
@@ -96,6 +96,8 @@ tx_start_time = 0                   # TX timer
 done = False                        # Thread stop flag
 transmit_enable = True              # Make sure that UC is half duplex
 useQRZ = True
+level_every_sample = 1
+NAT_ping_timer = 0
 
 listbox = None                      # tk object (talkgroup)
 transmitButton = None               # tk object
@@ -239,7 +241,10 @@ def showQRZImage( msg, in_label ):
     current_name.set(msg[3])
 
 ###################################################################################
-
+def ping_thread():
+    while done == False:
+        sleep(20.0)
+        sendUSRPCommand(bytes("PING", 'ASCII'), USRP_TYPE_PING)
 
 ###################################################################################
 # Log output to console
@@ -277,6 +282,10 @@ class MyDialog:
         b = ttk.Button(top, text=STRING_OK, command=self.ok)
         b.pack(pady=5)
         self.e.focus_set()
+
+    def popdown(self, popdown_state):
+        if ((popdown_state != None) and (popdown_state == True)):
+            self.e.event_generate('<Button-1>')
 
     def cancel(self, event=None):
         self.top.destroy()
@@ -323,7 +332,8 @@ def openStream():
     except:
         logging.info(STRING_WINDOWS_PORT_REUSE)
         pass
-    udp.bind(('', usrp_rx_port))
+    if (usrp_rx_port in usrp_tx_port) == False:    # single  port reply does not need a bind
+        udp.bind(('', usrp_rx_port))
 
 def sendto(usrp):
     for port in usrp_tx_port:
@@ -382,7 +392,7 @@ def rxAudioStream():
     EXITING = bytes("EXITING", 'ASCII')
 
     FORMAT = pyaudio.paInt16
-    CHUNK = 160
+    CHUNK = 160 if SAMPLE_RATE == 8000 else (160*6)     # Size of chunk to read
     CHANNELS = 1
     RATE = SAMPLE_RATE
     
@@ -433,11 +443,12 @@ def rxAudioStream():
                 if (len(audio) == 320):
                     if RATE == 48000:
                         (audio48, state) = audioop.ratecv(audio, 2, 1, 8000, 48000, state)
-                        stream.write(bytes(audio48), 160 * 6)
-                        rms = audioop.rms(audio, 2)     # Get a relative power value for the sample
-                        audio_level.set(int(rms/100))
+                        stream.write(bytes(audio48), CHUNK)
+                        if (seq % level_every_sample) == 0:
+                            rms = audioop.rms(audio, 2)     # Get a relative power value for the sample
+                            audio_level.set(int(rms/100))
                     else:
-                        stream.write(audio, 160)
+                        stream.write(audio, CHUNK)
                 if (keyup != lastKey):
                     logging.debug('key' if keyup else 'unkey')
                     if keyup:
@@ -613,8 +624,9 @@ def txAudioStream():
                         )
     except:
         logging.critical(STRING_FATAL_INPUT_STREAM + str(sys.exc_info()[1]))
-        messagebox.showinfo(STRING_USRP_CLIENT, STRING_INPUT_STREAM_ERROR)
-        os._exit(1)
+        transmit_enable = False
+        ipc_queue.put(("dialog", "Text Message", STRING_INPUT_STREAM_ERROR))
+        return
 
     _i = p.get_default_output_device_info().get('index') if in_index == None else in_index
     logging.info("Input Device: {} Index: {}".format(p.get_device_info_by_host_api_device_index(0, _i).get('name'), _i))
@@ -935,6 +947,8 @@ def disconnect():
 ###################################################################################
 def popup_toast(msg):
     global toast_frame
+    if toast_frame != None: # If a toast is still on the screen, kill it first
+        toast_frame.destroy()
     toast_frame = Toplevel()
     toast_frame.wm_title(msg[1])
     toast_frame.overrideredirect(1)
@@ -948,13 +962,16 @@ def popup_toast(msg):
     toast_frame.after(2000, toast_fade_away)
 
 def toast_fade_away():
-    alpha = toast_frame.attributes("-alpha")
-    if alpha > 0:
-        alpha -= .1
-        toast_frame.attributes("-alpha", alpha)
-        toast_frame.after(100, toast_fade_away)
-    else:
-        toast_frame.destroy()
+    global toast_frame
+    if toast_frame != None:
+        alpha = toast_frame.attributes("-alpha")
+        if alpha > 0:
+            alpha -= .1
+            toast_frame.attributes("-alpha", alpha)
+            toast_frame.after(100, toast_fade_away)
+        else:
+            toast_frame.destroy()
+            toast_frame = None
  
 def process_queue():
     try:
@@ -964,7 +981,9 @@ def process_queue():
         if msg[0] == "photo":    # an image is just a string containing the call to display
             showQRZImage(msg, qrz_label) 
         if msg[0] == "macro":
-            tgDialog();       
+            tgDialog(True)       
+        if msg[0] == "dialog":
+            messagebox.showinfo(STRING_USRP_CLIENT, msg[2], parent=root)
     except queue.Empty:
         pass
     root.after(100, process_queue)
@@ -1119,8 +1138,9 @@ def whiteLabel(parent, textVal):
 ###################################################################################
 # Popup the Talkgroup dialog.  This dialog lets the user enter a custom TG into the list
 ###################################################################################
-def tgDialog():
+def tgDialog(popdown_state):
     d = MyDialog(root)
+    d.popdown(popdown_state)
     root.wait_window(d.top)
 
 ###################################################################################
@@ -1194,7 +1214,7 @@ def makeGroupFrame( parent ):
     listbox.config(yscrollcommand=scrollbar.set)
 
     fillTalkgroupList(defaultServer)
-    ttk.Button(dmrFrame, text=STRING_TG, command=tgDialog, width = 3).grid(column=1, row=3, sticky=W)
+    ttk.Button(dmrFrame, text=STRING_TG, command= lambda: tgDialog(False), width = 3).grid(column=1, row=3, sticky=W)
     ttk.Button(dmrFrame, text=STRING_CONNECT, command= lambda: connect(None)).grid(column=2, row=3, sticky=W)
     ttk.Button(dmrFrame, text=STRING_DISCONNECT, command=disconnectButton).grid(column=3, row=3, sticky=W)
     return dmrFrame
@@ -1295,6 +1315,7 @@ def makeModeSettingsFrame( parent ):
     w.grid(column=2, row=1, sticky=W, padx = 5, pady = ypad)
     w.config(fg=uc_text_color, bg=uc_background_color)
     w["menu"].config(fg=uc_text_color)
+    w["menu"].config(bg=uc_background_color)
 
     whiteLabel(dmrgroup, STRING_REPEATER_ID).grid(column=1, row=2, sticky=W, padx = 5, pady = ypad)
     Entry(dmrgroup, width = 20, bg = uc_background_color, fg=uc_text_color, textvariable = repeater_id).grid(column=2, row=2, pady = ypad)
@@ -1410,6 +1431,7 @@ def setStyles():
     style.theme_use("clam")
     style.configure("Treeview", background=uc_background_color, fieldbackground=uc_background_color, foreground=uc_text_color)
     style.configure('TNotebook.Tab', foreground=uc_text_color, background=uc_background_color)
+    style.map('TNotebook.Tab', background=[('disabled', 'magenta')])
     style.configure('TButton', foreground=uc_text_color, background=uc_background_color)
     style.configure("bar.Horizontal.TProgressbar", troughcolor=uc_background_color, bordercolor=uc_text_color, background="green", lightcolor="green", darkcolor="green")
 
@@ -1545,6 +1567,8 @@ try:
     defaultServer = config.get('DEFAULTS', "defaultServer").split(None)[0]
     asl_mode = makeTkVar(IntVar, config.get('DEFAULTS', "aslMode").split(None)[0])
     useQRZ = bool(readValue(config, 'DEFAULTS', 'useQRZ', True, int))
+    level_every_sample = int(readValue(config, 'DEFAULTS', 'levelEverySample', 2, int))
+    NAT_ping_timer = int(readValue(config, 'DEFAULTS', 'pingTimer', 0, int))
 
     in_index = readValue(config, 'DEFAULTS', 'in_index', None, int)
     out_index = readValue(config, 'DEFAULTS', 'out_index', None, int)
@@ -1597,6 +1621,8 @@ _thread.start_new_thread( rxAudioStream, () )
 if in_index != -1:  # Do not launch the TX thread if the user wants RX only access
     _thread.start_new_thread( txAudioStream, () )
 _thread.start_new_thread( html_thread, () )     # Start up the HTML thread for background image loads
+if NAT_ping_timer > 0:
+    _thread.start_new_thread( ping_thread, () )
 
 disconnect()    # Start out in the disconnected state
 start()         # Begin the handshake with AB (register)
